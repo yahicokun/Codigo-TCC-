@@ -1,0 +1,280 @@
+from ase.db import connect
+from ase import Atoms
+import numpy as np
+import torch
+import torch.nn as nn
+import optuna
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_squared_error, r2_score
+from dscribe.descriptors import MBTR, SOAP, CoulombMatrix
+import tools
+import json
+import time
+from pathlib import Path
+from datetime import datetime
+import warnings
+warnings.filterwarnings('ignore')
+
+# ==============================
+# ⚙️ CONFIGURAÇÃO
+# ==============================
+DESCRIPTOR_TYPE = "mbtr"  # "mbtr", "soap", "coulomb"
+MAX_SAMPLES = 50
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Using device:", device)
+
+start_time = time.time()
+
+# ==============================
+# 🔬 FUNÇÃO DE DESCRITORES
+# ==============================
+def generate_descriptor(descriptor_type, elements, positions, lattice, trial, max_atoms=None):
+
+    # ======================
+    # MBTR
+    # ======================
+    if descriptor_type == "mbtr":
+
+        estrutura = tools.custom_bulk(elements, positions, lattice)
+
+        grid_min = trial.suggest_float("grid_min", 1.0, 50.0, log=True)
+        grid_max = trial.suggest_float("grid_max", 100.0, 1000.0, log=True)
+        grid_sigma = trial.suggest_float("grid_sigma", 0.1, 100.0, log=True)
+        grid_n = trial.suggest_int("grid_n", 50, 500)
+        weighting_scale = trial.suggest_float("weighting_scale", 0.1, 20.0)
+        weighting_threshold = trial.suggest_float("weighting_threshold", 1e-3, 100.0, log=True)
+
+        descriptor = MBTR(
+            species=list(set(elements)),
+            geometry={"function": "atomic_number"},
+            grid={"min": grid_min, "max": grid_max, "sigma": grid_sigma, "n": grid_n},
+            weighting={"function": "unity", "scale": weighting_scale, "threshold": weighting_threshold},
+            normalization="none",
+            periodic=True,
+            sparse=False,
+        )
+
+        return descriptor.create(estrutura).flatten()
+
+    # ======================
+    # SOAP
+    # ======================
+    elif descriptor_type == "soap":
+
+        estrutura = tools.custom_bulk(elements, positions, lattice)
+
+        rcut = trial.suggest_float("rcut", 3.0, 8.0)
+        nmax = trial.suggest_int("nmax", 1, 5)
+        lmax = trial.suggest_int("lmax", 1, 5)
+        sigma = trial.suggest_float("sigma", 0.1, 1.5)
+
+        descriptor = SOAP(
+            species=list(set(elements)),
+            periodic=True,
+            r_cut=rcut,
+            n_max=nmax,
+            l_max=lmax,
+            sigma=sigma
+        )
+
+        # 🔥 IMPORTANTE: média
+        return descriptor.create(estrutura).mean(axis=0)
+
+    # ======================
+    # COULOMB 
+    # ======================
+    elif descriptor_type == "coulomb":
+
+        if max_atoms is None:
+            raise ValueError("max_atoms necessário para Coulomb Matrix")
+
+        permutation = trial.suggest_categorical("permutation", ["sorted_l2", "none"])
+
+        descriptor = CoulombMatrix(
+            n_atoms_max=max_atoms,
+            permutation=permutation
+        )
+
+        # 🔥 CORREÇÃO PRINCIPAL: usar ASE Atoms direto
+        estrutura = Atoms(symbols=elements, positions=positions)
+
+        return descriptor.create(estrutura).flatten()
+
+    else:
+        raise ValueError("Descritor inválido")
+
+
+# ==============================
+# 🎯 OBJECTIVE
+# ==============================
+def objective(trial):
+
+    key = "gap"
+    db = connect(r"C:\Users\Usuario\Desktop\TCC\projeto_tcc\Banco de dados\c2db-2022-11-30.db")
+
+    # 🔥 CORREÇÃO: fixar dataset
+    db_list = list(db.select(f"0<{key}<1000"))[:MAX_SAMPLES]
+
+    descriptors_list = []
+    target_values = []
+
+    print(f"\n🔄 Trial {trial.number} ({DESCRIPTOR_TYPE.upper()})")
+
+    # ======================
+    # max_atoms consistente
+    # ======================
+    max_atoms = 0
+    if DESCRIPTOR_TYPE == "coulomb":
+        for row in db_list:
+            atom = row.toatoms()
+            max_atoms = max(max_atoms, len(atom))
+
+    # ======================
+    # geração
+    # ======================
+    for row in db_list:
+        atom = row.toatoms()
+
+        try:
+            descriptor = generate_descriptor(
+                DESCRIPTOR_TYPE,
+                atom.get_chemical_symbols(),
+                atom.get_positions(),
+                atom.cell.cellpar(),
+                trial,
+                max_atoms=max_atoms
+            )
+
+            descriptors_list.append(descriptor)
+            target_values.append(eval(f'row.{key}'))
+
+        except Exception as e:
+            print("⚠️ Erro descriptor:", e)
+            continue
+
+    # ======================
+    # fallback
+    # ======================
+    if len(descriptors_list) < 5:
+        print("❌ Poucos descritores válidos")
+        return float('inf')
+
+    # ======================
+    # padding
+    # ======================
+    max_len = max(len(d) for d in descriptors_list)
+
+    def pad(x):
+        return np.pad(x, (0, max_len - len(x))) if len(x) < max_len else x[:max_len]
+
+    X = np.array([pad(d) for d in descriptors_list])
+    y = np.array(target_values)
+
+    # ======================
+    # split
+    # ======================
+    X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2)
+
+    scaler = StandardScaler()
+    X_train = scaler.fit_transform(X_train)
+    X_val = scaler.transform(X_val)
+
+    X_train = torch.tensor(X_train, dtype=torch.float32).to(device)
+    X_val = torch.tensor(X_val, dtype=torch.float32).to(device)
+    y_train = torch.tensor(y_train, dtype=torch.float32).view(-1,1).to(device)
+    y_val = torch.tensor(y_val, dtype=torch.float32).view(-1,1).to(device)
+
+    # ======================
+    # MLP
+    # ======================
+    class MLP(nn.Module):
+        def __init__(self, input_size, hidden_sizes):
+            super().__init__()
+            layers = []
+            last = input_size
+            for h in hidden_sizes:
+                layers.append(nn.Linear(last, h))
+                layers.append(nn.ReLU())
+                layers.append(nn.Dropout(0.1))
+                last = h
+            layers.append(nn.Linear(last,1))
+            self.net = nn.Sequential(*layers)
+
+        def forward(self,x):
+            return self.net(x)
+
+    n_layers = trial.suggest_int("n_layers", 1, 3)
+    hidden_sizes = [trial.suggest_int(f"h{i}", 32, 128) for i in range(n_layers)]
+
+    model = MLP(X_train.shape[1], hidden_sizes).to(device)
+
+    lr = trial.suggest_float("lr", 1e-4, 1e-2, log=True)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    loss_fn = nn.MSELoss()
+
+    for _ in range(15):
+        model.train()
+        optimizer.zero_grad()
+        loss = loss_fn(model(X_train), y_train)
+        loss.backward()
+        optimizer.step()
+
+    model.eval()
+    with torch.no_grad():
+        pred = model(X_val).cpu().numpy().flatten()
+        y_true = y_val.cpu().numpy().flatten()
+
+    mse = mean_squared_error(y_true, pred)
+    r2 = r2_score(y_true, pred)
+
+    trial.set_user_attr("r2", r2)
+
+    print(f"MSE: {mse:.4f} | R2: {r2:.4f}")
+
+    return mse
+
+
+# ==============================
+# 🚀 OPTUNA
+# ==============================
+study = optuna.create_study(direction="minimize")
+study.optimize(objective, n_trials=50)
+
+
+# ==============================
+# 💾 JSON (SOMENTE DESCRITOR SELECIONADO)
+# ==============================
+
+best = study.best_trial
+best_params = best.params
+best_r2 = best.user_attrs.get("r2", 0)
+
+output_dir = Path("json_descritores")
+output_dir.mkdir(exist_ok=True)
+
+timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+# 🔥 JSON SIMPLIFICADO
+
+json_output = {
+    "descriptor_type": DESCRIPTOR_TYPE,
+    "performance_metrics": {
+        "best_validation_mse": study.best_value,
+        "best_r2_score": best_r2,
+        "total_time": time.time() - start_time
+    },
+    "best_parameters": {
+        DESCRIPTOR_TYPE : best_params
+    }
+}
+
+# 🔥 Nome do arquivo baseado no descritor
+path = output_dir / f"{DESCRIPTOR_TYPE}_{timestamp}_{best_r2:.4f}.json"
+
+with open(path, "w") as f:
+    json.dump(json_output, f, indent=4)
+
+print("✅ JSON salvo:", path)
